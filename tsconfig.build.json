@@ -6,6 +6,6 @@
     "jsx": "react-jsx",
     "lib": ["ES2022"]
   },
-  "include": ["src/engine/**/*.ts", "src/cli/**/*.ts", "src/cli/**/*.tsx"],
+  "include": ["src/engine/**/*.ts", "src/providers/**/*.ts", "src/skills/**/*.ts", "src/cli/**/*.ts", "src/cli/**/*.tsx"],
   "exclude": ["node_modules", "dist"]
 }

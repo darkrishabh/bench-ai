@@ -9,6 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { App } from "./app.js";
 import { RunCommand, type JudgeChoice } from "./run-command.js";
+import { registerSkillsCommand } from "./skills.js";
 import type { ProviderName, ProviderConfig } from "../engine/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -131,6 +132,8 @@ program
       );
     }
   );
+
+registerSkillsCommand(program);
 
 // ── web (Next.js UI) ──────────────────────────────────────────────────────────
 

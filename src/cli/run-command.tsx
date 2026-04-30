@@ -61,9 +61,8 @@ export function RunCommand({
   useEffect(() => {
     const run = async () => {
       try {
-        // Load config
-        const yaml = readFileSync(configPath, "utf-8");
-        const config = parseSuiteConfig(yaml);
+        // Load native Bench AI YAML suite.
+        const config = parseSuiteConfig(readFileSync(configPath, "utf-8"));
 
         // Build providers from --models flag using env vars
         const providerNames = models.split(",").map((m) => m.trim());

@@ -182,6 +182,49 @@ npx @darkrishabh/bench-ai run --config examples/bench-ai.yaml --judge none
 
 With a global install (`npm i -g @darkrishabh/bench-ai`), use **`bench-ai run --config …`** instead of **`npx @darkrishabh/bench-ai`**.
 
+### Evaluating skills (agentskills.io)
+
+Bench AI can run [agentskills.io](https://agentskills.io/skill-creation/evaluating-skills) skill evals and write the standard artifact layout (`iteration-N/eval-*/{with_skill,without_skill}/outputs`, `timing.json`, `grading.json`, plus `benchmark.json`).
+
+```ts
+import { evaluateSkills } from "@darkrishabh/bench-ai/skills";
+import { OpenAICompatibleProvider } from "@darkrishabh/bench-ai/providers";
+
+const provider = new OpenAICompatibleProvider({
+  baseUrl: process.env.OPENAI_BASE_URL!,
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+const { failed } = await evaluateSkills({
+  root: "./plugins",
+  workspace: "./bench-workspace",
+  baseline: true,
+  target: { model: "claude-haiku-4-5-20251001", provider },
+  judge: { model: "claude-sonnet-4-5", provider },
+});
+
+process.exit(failed > 0 ? 1 : 0);
+```
+
+CLI:
+
+```bash
+npx @darkrishabh/bench-ai skills ./plugins --baseline \
+  --target claude-haiku-4-5 --judge claude-sonnet-4-5 \
+  --workspace ./bench-workspace
+```
+
+The supported skill shape follows the standard:
+
+```text
+my-skill/
+├── SKILL.md
+└── evals/
+    └── evals.json
+```
+
+`SKILL.md` should include `name` and `description` YAML frontmatter. `evals/evals.json` includes `skill_name` and an `evals` array with `id`, `prompt`, `expected_output`, optional `files`, and optional assertion strings. See [`examples/skills/code-review`](examples/skills/code-review).
+
 The web app runs the same engine at `POST /api/suite` with SSE live logs when `stream: true`.
 
 ---

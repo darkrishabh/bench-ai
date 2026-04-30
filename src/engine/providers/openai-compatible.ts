@@ -1,17 +1,32 @@
-import { calcCost } from "../cost.js";
 import type { ProviderResult } from "../types.js";
 import type { Provider } from "./base.js";
+import type { AttachedFile } from "../../skills/types.js";
 
 export interface OpenAICompatibleOptions {
+  providerName?: string;
+  model?: string;
   maxTokens?: number;
   temperature?: number;
   /** Extra headers to merge into every request (e.g. HTTP-Referer for OpenRouter) */
   extraHeaders?: Record<string, string>;
+  timeoutMs?: number;
+  retry?: {
+    attempts?: number;
+    backoffMs?: number;
+  };
 }
 
 interface OpenAIChatResponse {
   choices: Array<{ message: { content: string }; finish_reason?: string }>;
-  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    costs?: {
+      prompt?: number;
+      completion?: number;
+    };
+  };
   model?: string;
 }
 
@@ -44,6 +59,7 @@ function openAiGpt5DotSeriesAllowsSamplingParams(model: string): boolean {
 }
 
 export class OpenAICompatibleProvider implements Provider {
+  readonly capabilities = { systemRole: true, attachments: false };
   /** Shown as `provider` in ProviderResult — pass the human name, e.g. "openai", "groq" */
   readonly name: string;
   readonly model: string;
@@ -52,25 +68,44 @@ export class OpenAICompatibleProvider implements Provider {
   private options: OpenAICompatibleOptions;
 
   constructor(
-    name: string,
-    baseUrl: string,
-    apiKey: string,
-    model: string,
+    nameOrOptions: string | (OpenAICompatibleOptions & { baseUrl: string; apiKey: string }),
+    baseUrl?: string,
+    apiKey?: string,
+    model?: string,
     options: OpenAICompatibleOptions = {}
   ) {
-    this.name = name;
-    this.baseUrl = baseUrl.replace(/\/$/, "");
-    this.apiKey = apiKey;
-    this.model = model;
-    this.options = options;
+    if (typeof nameOrOptions === "string") {
+      this.name = nameOrOptions;
+      this.baseUrl = (baseUrl ?? "").replace(/\/$/, "");
+      this.apiKey = apiKey ?? "";
+      this.model = model ?? "gpt-4o-mini";
+      this.options = options;
+    } else {
+      this.name = nameOrOptions.providerName ?? "openai-compatible";
+      this.baseUrl = nameOrOptions.baseUrl.replace(/\/$/, "");
+      this.apiKey = nameOrOptions.apiKey;
+      this.model = nameOrOptions.model ?? "gpt-4o-mini";
+      this.options = nameOrOptions;
+    }
   }
 
   async complete(prompt: string): Promise<ProviderResult> {
+    return this.completeChat({ user: prompt });
+  }
+
+  async completeChat(args: {
+    system?: string;
+    user: string;
+    attachments?: AttachedFile[];
+  }): Promise<ProviderResult> {
     const start = Date.now();
     try {
       const body: Record<string, unknown> = {
         model: this.model,
-        messages: [{ role: "user", content: prompt }],
+        messages: [
+          ...(args.system ? [{ role: "system", content: args.system }] : []),
+          { role: "user", content: args.user },
+        ],
       };
       if (this.options.maxTokens) {
         if (openAiUsesMaxCompletionTokens(this.model)) {
@@ -93,21 +128,14 @@ export class OpenAICompatibleProvider implements Provider {
       };
       if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
 
-      const res = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
+      const data = await this.fetchWithRetry(body, headers);
 
-      if (!res.ok) {
-        throw new Error(`${this.name} ${res.status}: ${await res.text()}`);
-      }
-
-      const data = (await res.json()) as OpenAIChatResponse;
       const latencyMs = Date.now() - start;
       const inputTokens = data.usage?.prompt_tokens ?? 0;
       const outputTokens = data.usage?.completion_tokens ?? 0;
       const output = data.choices[0]?.message.content ?? "";
+      const promptCost = data.usage?.costs?.prompt ?? 0;
+      const completionCost = data.usage?.costs?.completion ?? 0;
 
       return {
         provider: this.name,
@@ -116,7 +144,7 @@ export class OpenAICompatibleProvider implements Provider {
         latencyMs,
         inputTokens,
         outputTokens,
-        costUsd: calcCost(this.name, this.model, inputTokens, outputTokens),
+        costUsd: promptCost + completionCost,
       };
     } catch (err) {
       return {
@@ -130,5 +158,44 @@ export class OpenAICompatibleProvider implements Provider {
         error: err instanceof Error ? err.message : String(err),
       };
     }
+  }
+
+  private async fetchWithRetry(
+    body: Record<string, unknown>,
+    headers: Record<string, string>
+  ): Promise<OpenAIChatResponse> {
+    const attempts = this.options.retry?.attempts ?? 2;
+    const backoffMs = this.options.retry?.backoffMs ?? 1500;
+    let lastError: Error | undefined;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const controller = this.options.timeoutMs ? new AbortController() : undefined;
+      const timer = controller
+        ? setTimeout(() => controller.abort(), this.options.timeoutMs)
+        : undefined;
+      try {
+        const res = await fetch(`${this.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: controller?.signal,
+        });
+
+        if (!res.ok) {
+          throw new Error(`${this.name} ${res.status}: ${await res.text()}`);
+        }
+
+        return (await res.json()) as OpenAIChatResponse;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt < attempts) {
+          await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    throw lastError ?? new Error(`${this.name}: request failed`);
   }
 }

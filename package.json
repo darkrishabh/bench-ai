@@ -1,6 +1,6 @@
 {
   "name": "@darkrishabh/bench-ai",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Bench AI — compare LLM outputs across models: CLI, web UI, and YAML eval suites.",
   "type": "module",
   "bin": {
@@ -12,6 +12,14 @@
     ".": {
       "import": "./dist/engine/index.js",
       "types": "./dist/engine/index.d.ts"
+    },
+    "./skills": {
+      "import": "./dist/skills/index.js",
+      "types": "./dist/skills/index.d.ts"
+    },
+    "./providers": {
+      "import": "./dist/providers/index.js",
+      "types": "./dist/providers/index.d.ts"
     }
   },
   "files": [
@@ -45,6 +53,7 @@
     "build": "npm run build:engine && next build",
     "start": "next start",
     "type-check": "npm run build:engine && tsc -p tsconfig.json --noEmit",
+    "test": "npm run build:engine && node --test \"test/**/*.test.mjs\"",
     "clean": "rm -rf dist .next"
   },
   "dependencies": {
