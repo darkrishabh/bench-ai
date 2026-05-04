@@ -202,3 +202,97 @@ test("loadSkill throws with path-aware message on malformed assertion entry", ()
     (err) => /evals\[0\]\.assertions\[1\]/.test(err.message) && /text\|value\|criterion/.test(err.message),
   );
 });
+
+test("evaluateSkills runs eval cases in parallel under concurrency", async () => {
+  const root = tempRoot();
+  const name = "concurrent-skill";
+  const dir = path.join(root, name);
+  mkdirSync(path.join(dir, "evals"), { recursive: true });
+  writeFileSync(
+    path.join(dir, "SKILL.md"),
+    `---\nname: ${name}\ndescription: Concurrency test.\n---\n\nBody.\n`,
+  );
+  writeFileSync(
+    path.join(dir, "evals", "evals.json"),
+    JSON.stringify({
+      skill_name: name,
+      evals: [
+        { id: 1, name: "case-a", prompt: "do A", assertions: ["mentions A"] },
+        { id: 2, name: "case-b", prompt: "do B", assertions: ["mentions B"] },
+        { id: 3, name: "case-c", prompt: "do C", assertions: ["mentions C"] },
+      ],
+    }),
+  );
+
+  // Slow stub provider — every call sleeps 200ms before returning. Used for
+  // both target and judge so each eval = 1 target + 1 judge = ~400ms serial.
+  function slowProvider(output) {
+    return {
+      name: "slow",
+      model: "slow-model",
+      async complete() {
+        await new Promise((r) => setTimeout(r, 200));
+        return {
+          provider: "slow",
+          model: "slow-model",
+          output,
+          latencyMs: 200,
+          inputTokens: 1,
+          outputTokens: 1,
+          costUsd: 0,
+        };
+      },
+      async completeChat() {
+        await new Promise((r) => setTimeout(r, 200));
+        return {
+          provider: "slow",
+          model: "slow-model",
+          output,
+          latencyMs: 200,
+          inputTokens: 1,
+          outputTokens: 1,
+          costUsd: 0,
+        };
+      },
+    };
+  }
+
+  const judgeOutput = JSON.stringify({
+    assertion_results: [{ text: "mentions thing", passed: true, evidence: "ok" }],
+    summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 },
+  });
+
+  const workspace = path.join(root, "bench-workspace");
+  const t0 = Date.now();
+  const result = await evaluateSkills({
+    root,
+    workspace,
+    target: { model: "target", provider: slowProvider("ok response") },
+    judge: { model: "judge", provider: slowProvider(judgeOutput) },
+    concurrency: 3,
+    report: false,
+  });
+  const elapsed = Date.now() - t0;
+
+  // Sequentially: 3 evals × (200ms target + 200ms judge) = ~1200ms.
+  // With concurrency:3 the whole batch should finish in ~400ms; allow slack
+  // for CI jitter / Node startup but still well under the serial floor.
+  assert.ok(
+    elapsed < 500,
+    `expected concurrent run to finish in <500ms, got ${elapsed}ms`,
+  );
+
+  assert.equal(result.skills.length, 1);
+  const slug = result.skills[0].slug;
+  for (const evalSlug of ["eval-case-a", "eval-case-b", "eval-case-c"]) {
+    assert.ok(
+      existsSync(path.join(workspace, slug, evalSlug, "with_skill", "grading.json")),
+      `missing grading.json for ${evalSlug}`,
+    );
+    assert.ok(
+      existsSync(path.join(workspace, slug, evalSlug, "with_skill", "timing.json")),
+      `missing timing.json for ${evalSlug}`,
+    );
+  }
+  assert.ok(existsSync(result.skills[0].benchmarkPath), "benchmark.json should be written");
+});

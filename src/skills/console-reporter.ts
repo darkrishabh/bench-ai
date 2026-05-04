@@ -9,6 +9,11 @@
  *   - timing/tokens line per run
  *   - delta (with_skill vs without_skill) at suite end when baseline mode is on
  *
+ * Eval-level output is buffered per (skill, evalIndex, mode) and flushed as a
+ * single atomic block on `eval-end`. This keeps the output readable when
+ * multiple evals run in parallel — each eval's prompt / output / assertions /
+ * timing line stays contiguous instead of interleaving with siblings.
+ *
  * Zero runtime dependencies — color detection honors NO_COLOR / FORCE_COLOR / TTY.
  */
 
@@ -106,7 +111,7 @@ function pluralize(count: number, word: string): string {
 export function consoleReporter(options: ConsoleReporterOptions = {}): (event: SkillsEvent) => void {
   const colorOn = detectColor(options.color);
   const paint = makePainter(colorOn);
-  const out = options.out ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const baseOut = options.out ?? ((line: string) => process.stdout.write(`${line}\n`));
   const verbose = options.verbose === true;
   const snippetLength = options.snippetLength ?? 200;
 
@@ -114,18 +119,33 @@ export function consoleReporter(options: ConsoleReporterOptions = {}): (event: S
   // doubles the number of runs.
   const evalCounters = new Map<string, number>();
 
+  // Per-(skill, evalIndex, mode) buffers. eval-start opens one and routes all
+  // subsequent writes to it; eval-end flushes the whole block atomically and
+  // clears the buffer. Suite-level events bypass the buffer entirely.
+  const buffers = new Map<string, string[]>();
+  let activeBuffer: string[] | null = null;
+
+  function bufferKey(e: { skill: string; evalIndex: number; mode: RunMode }): string {
+    return `${e.skill}::${e.evalIndex}::${e.mode}`;
+  }
+
+  function write(line: string): void {
+    if (activeBuffer) activeBuffer.push(line);
+    else baseOut(line);
+  }
+
   function onSuiteStart(e: SuiteStartEvent): void {
     const head = paint("bold", `\u25b6 ${e.skill}`);
     const rel = paint("gray", e.relPath);
-    out("");
-    out(`${head}  ${rel}`);
+    baseOut("");
+    baseOut(`${head}  ${rel}`);
     const meta = [
       `${pluralize(e.evalsCount, "eval")}`,
       `target=${e.target}`,
       `judge=${e.judge}`,
       `modes=${e.modes.join(",")}`,
     ].join("  ");
-    out(`  ${paint("gray", meta)}`);
+    baseOut(`  ${paint("gray", meta)}`);
     evalCounters.set(e.skill, 0);
   }
 
@@ -133,27 +153,32 @@ export function consoleReporter(options: ConsoleReporterOptions = {}): (event: S
     const counter = (evalCounters.get(e.skill) ?? 0) + 1;
     evalCounters.set(e.skill, counter);
 
+    const key = bufferKey(e);
+    const buf: string[] = [];
+    buffers.set(key, buf);
+    activeBuffer = buf;
+
     const label = e.evalName ? e.evalName : e.evalId !== undefined ? `eval-${e.evalId}` : `eval-${e.evalIndex + 1}`;
     const id = e.evalId !== undefined ? `#${e.evalId}` : `#${e.evalIndex + 1}`;
     const fileTag = e.fileCount > 0 ? paint("gray", ` (+${e.fileCount} file${e.fileCount === 1 ? "" : "s"})`) : "";
 
-    out("");
-    out(
+    write("");
+    write(
       `  ${paint("bold", `${id} ${label}`)}  ${modeBadge(e.mode, paint)}${fileTag}  ${paint("gray", `[${counter}]`)}`
     );
 
     if (verbose) {
       if (e.system) {
-        out(`    ${paint("gray", "system:")}`);
-        out(indent(e.system, "      "));
+        write(`    ${paint("gray", "system:")}`);
+        write(indent(e.system, "      "));
       }
-      out(`    ${paint("gray", "user:")}`);
-      out(indent(e.user, "      "));
+      write(`    ${paint("gray", "user:")}`);
+      write(indent(e.user, "      "));
     } else {
       if (e.system) {
-        out(`    ${paint("gray", "system:")}  ${clip(e.system, snippetLength)}`);
+        write(`    ${paint("gray", "system:")}  ${clip(e.system, snippetLength)}`);
       }
-      out(`    ${paint("gray", "user:")}    ${clip(e.user, snippetLength)}`);
+      write(`    ${paint("gray", "user:")}    ${clip(e.user, snippetLength)}`);
     }
 
     if (e.tools && e.tools.length > 0) {
@@ -163,8 +188,10 @@ export function consoleReporter(options: ConsoleReporterOptions = {}): (event: S
         : e.toolChoice
           ? `force=${e.toolChoice.function.name}`
           : "auto";
-      out(`    ${paint("gray", "tools:")}   ${paint("yellow", names)} ${paint("gray", `(choice=${choice})`)}`);
+      write(`    ${paint("gray", "tools:")}   ${paint("yellow", names)} ${paint("gray", `(choice=${choice})`)}`);
     }
+
+    activeBuffer = null;
   }
 
   function summarizeToolCalls(calls: ToolCall[]): string {
@@ -179,6 +206,12 @@ export function consoleReporter(options: ConsoleReporterOptions = {}): (event: S
   }
 
   function onEvalEnd(e: EvalEndEvent): void {
+    const key = bufferKey(e);
+    const buf = buffers.get(key);
+    // If eval-start was missed (shouldn't happen in normal flow) fall back to
+    // direct stdout writes so we don't silently drop output.
+    activeBuffer = buf ?? null;
+
     const summary = e.grading.summary;
     const passed = summary.failed === 0 && summary.total > 0;
     const verdict =
@@ -189,43 +222,50 @@ export function consoleReporter(options: ConsoleReporterOptions = {}): (event: S
           : paint("red", "FAIL");
 
     if (verbose) {
-      out(`    ${paint("gray", "output:")}`);
-      out(indent(e.output || "(empty)", "      "));
+      write(`    ${paint("gray", "output:")}`);
+      write(indent(e.output || "(empty)", "      "));
     } else {
-      out(`    ${paint("gray", "output:")}  ${clip(e.output || "(empty)", snippetLength)}`);
+      write(`    ${paint("gray", "output:")}  ${clip(e.output || "(empty)", snippetLength)}`);
     }
 
     if (e.toolCalls && e.toolCalls.length > 0) {
-      out(`    ${paint("gray", "calls:")}   ${paint("yellow", summarizeToolCalls(e.toolCalls))}`);
+      write(`    ${paint("gray", "calls:")}   ${paint("yellow", summarizeToolCalls(e.toolCalls))}`);
       if (verbose) {
         for (const [i, c] of e.toolCalls.entries()) {
           const args = c.parsedArguments !== undefined
             ? JSON.stringify(c.parsedArguments, null, 2)
             : c.function.arguments || "(empty)";
-          out(`      ${paint("yellow", `[${i + 1}] ${c.function.name}`)}`);
-          out(indent(args, "          "));
+          write(`      ${paint("yellow", `[${i + 1}] ${c.function.name}`)}`);
+          write(indent(args, "          "));
         }
       }
     }
 
     if (e.grading.assertion_results.length > 0) {
-      out(`    ${paint("gray", "asserts:")} ${summarizeAssertions(e.grading.assertion_results, paint)}`);
+      write(`    ${paint("gray", "asserts:")} ${summarizeAssertions(e.grading.assertion_results, paint)}`);
       for (const [i, r] of e.grading.assertion_results.entries()) {
         if (r.passed && !verbose) continue;
         const num = paint(r.passed ? "green" : "red", `#${i + 1}`);
         const status = r.passed ? paint("green", "PASS") : paint("red", "FAIL");
-        out(`      ${num} ${status} ${paint("gray", "\u2014")} ${clip(r.text, snippetLength)}`);
-        if (r.evidence) out(`         ${paint("gray", "evidence:")} ${clip(r.evidence, snippetLength)}`);
+        write(`      ${num} ${status} ${paint("gray", "\u2014")} ${clip(r.text, snippetLength)}`);
+        if (r.evidence) write(`         ${paint("gray", "evidence:")} ${clip(r.evidence, snippetLength)}`);
       }
     }
 
     if (verbose && e.judgePrompt) {
-      out(`    ${paint("gray", "judge prompt:")}`);
-      out(indent(e.judgePrompt, "      "));
+      write(`    ${paint("gray", "judge prompt:")}`);
+      write(indent(e.judgePrompt, "      "));
     }
 
     const stats = `${formatDuration(e.timing.duration_ms)} \u00b7 ${e.timing.total_tokens} tokens \u00b7 ${verdict}`;
-    out(`    ${stats}`);
+    write(`    ${stats}`);
+
+    activeBuffer = null;
+    if (buf) {
+      // Atomic flush: one write per (skill, eval, mode) block.
+      baseOut(buf.join("\n"));
+      buffers.delete(key);
+    }
   }
 
   function onSuiteEnd(e: SuiteEndEvent): void {
@@ -241,30 +281,30 @@ export function consoleReporter(options: ConsoleReporterOptions = {}): (event: S
       const ppDelta = rs.delta.pass_rate * 100;
       const ppColor: ColorName = ppDelta > 0 ? "green" : ppDelta < 0 ? "red" : "gray";
       const sign = (n: number, suffix = "") => `${n >= 0 ? "+" : ""}${n.toFixed(1)}${suffix}`;
-      out("");
-      out(
+      baseOut("");
+      baseOut(
         `  ${paint("bold", "summary")}  ${paint("cyan", `with_skill ${withPct}%`)}  vs  ${paint(
           "magenta",
           `without_skill ${withoutPct}%`
         )}`
       );
-      out(
+      baseOut(
         `    ${paint("gray", "\u0394")} pass-rate ${paint(ppColor, sign(ppDelta, "pp"))}  ` +
           `time ${sign(rs.delta.time_seconds, "s")}  ` +
           `tokens ${sign(rs.delta.tokens)}`
       );
-      out(`    ${paint("gray", "with_skill:")}    ${withTime}s avg \u00b7 ${withTokens} tok avg`);
-      out(`    ${paint("gray", "without_skill:")} ${withoutTime}s avg \u00b7 ${withoutTokens} tok avg`);
+      baseOut(`    ${paint("gray", "with_skill:")}    ${withTime}s avg \u00b7 ${withTokens} tok avg`);
+      baseOut(`    ${paint("gray", "without_skill:")} ${withoutTime}s avg \u00b7 ${withoutTokens} tok avg`);
     } else {
-      out("");
-      out(
+      baseOut("");
+      baseOut(
         `  ${paint("bold", "summary")}  ${paint("cyan", `with_skill ${withPct}%`)}  ${paint(
           "gray",
           `\u00b7 ${withTime}s avg \u00b7 ${withTokens} tok avg`
         )}`
       );
     }
-    out(`  ${paint("gray", `benchmark: ${e.benchmarkPath}`)}`);
+    baseOut(`  ${paint("gray", `benchmark: ${e.benchmarkPath}`)}`);
   }
 
   return (event: SkillsEvent) => {

@@ -8,12 +8,12 @@ import {
   snapshotSkillToHistory,
 } from "./artifacts.js";
 import { consoleReporter } from "./console-reporter.js";
-import { discoverSkills } from "./discover.js";
+import { discoverSkills, type SkillRef } from "./discover.js";
 import { generateReport } from "./report.js";
 import { runEval, type RunMode } from "./run-eval.js";
 import { loadSkill } from "./skill.js";
 import { slugify } from "./fs-utils.js";
-import type { SkillsEvent } from "./types.js";
+import type { AgentSkillsEval, Skill, SkillsEvent } from "./types.js";
 
 export interface EvaluateSkillsArgs {
   root: string;
@@ -51,6 +51,13 @@ export interface EvaluateSkillsArgs {
    * evaluation completes. Default true; pass `false` to skip.
    */
   report?: boolean;
+  /**
+   * Maximum number of eval cases run in parallel. Defaults to 4. Each
+   * in-flight case makes one target call + one judge call to the configured
+   * providers, so effective concurrent gateway requests is up to 2× this
+   * number. Pass `1` to restore strict-serial behavior (handy for debugging).
+   */
+  concurrency?: number;
 }
 
 export interface EvaluateSkillsResult {
@@ -70,6 +77,40 @@ export interface EvaluateSkillsResult {
   reportPath?: string;
 }
 
+interface PreparedSkill {
+  ref: SkillRef;
+  skill: Skill;
+  slug: string;
+  skillDir: string;
+  aggregateRuns: { mode: RunMode; passRate: number; durationMs: number; tokens: number }[];
+  passed: number;
+  failed: number;
+  completed: number;
+}
+
+interface Task {
+  prepared: PreparedSkill;
+  evalCase: AgentSkillsEval;
+  index: number;
+}
+
+/**
+ * Tiny bounded-concurrency worker pool. Each worker grabs the next item off a
+ * shared FIFO queue and runs `work` on it; resolves once the queue is drained.
+ * Order of completion is non-deterministic across items.
+ */
+async function runPool<T>(items: T[], n: number, work: (t: T) => Promise<void>): Promise<void> {
+  const queue = items.slice();
+  const workers = Array.from({ length: Math.max(1, Math.min(n, items.length)) }, async () => {
+    while (queue.length > 0) {
+      const next = queue.shift();
+      if (next === undefined) return;
+      await work(next);
+    }
+  });
+  await Promise.all(workers);
+}
+
 export async function evaluateSkills(args: EvaluateSkillsArgs): Promise<EvaluateSkillsResult> {
   const refs = discoverSkills(args.root, { include: args.include, exclude: args.exclude }).filter((ref) => ref.hasEvals);
   const modes: RunMode[] = args.baseline ? ["with_skill", "without_skill"] : ["with_skill"];
@@ -82,11 +123,12 @@ export async function evaluateSkills(args: EvaluateSkillsArgs): Promise<Evaluate
       ? undefined
       : consoleReporter();
 
-  let passed = 0;
-  let failed = 0;
-  const skills: EvaluateSkillsResult["skills"] = [];
-  const writtenSkillDirs: { slug: string; dir: string }[] = [];
+  const concurrency = Math.max(1, args.concurrency ?? 4);
 
+  // ─── Phase 1: sequential discovery prep ───────────────────────────────────
+  // Allocate skillDir + write meta.json + emit suite-start in discovery order
+  // so the start-of-run banner is stable run-to-run regardless of pool size.
+  const prepared: PreparedSkill[] = [];
   for (const ref of refs) {
     args.onLog?.(`skill ${ref.name}: loading ${ref.relPath}`);
     const skill = loadSkill(ref.dir);
@@ -110,10 +152,6 @@ export async function evaluateSkills(args: EvaluateSkillsArgs): Promise<Evaluate
       "utf-8"
     );
 
-    const aggregateRuns: { mode: RunMode; passRate: number; durationMs: number; tokens: number }[] = [];
-    let skillPassed = 0;
-    let skillFailed = 0;
-
     emit?.({
       type: "suite-start",
       skill: skill.name,
@@ -124,65 +162,99 @@ export async function evaluateSkills(args: EvaluateSkillsArgs): Promise<Evaluate
       judge: args.judge.model,
     });
 
-    for (let index = 0; index < skill.evals.length; index++) {
-      const evalCase = skill.evals[index];
-      args.onLog?.(`skill ${skill.name}: eval ${evalCase.name ?? evalCase.id ?? index + 1}`);
-      const result = await runEval({
-        skill,
-        eval: evalCase,
-        index,
-        modes,
-        target: args.target,
-        judge: args.judge,
-        workspace: args.workspace,
-        evalRootDir: skillDir,
-        iteration: 0,
-        targetParams: args.targetParams,
-        judgeParams: args.judgeParams,
-        onEvent: emit,
+    prepared.push({ ref, skill, slug, skillDir, aggregateRuns: [], passed: 0, failed: 0, completed: 0 });
+  }
+
+  // ─── Phase 2: flatten (skill, evalCase) tasks + run via worker pool ───────
+  // Cross-skill ordering note: with concurrency > 1, suite-end for skill A
+  // may fire before suite-end for skill B even if A appears later in
+  // discovery — completion order tracks the pool, not the discovery walk.
+  // Per-eval ordering is preserved: eval-start strictly precedes eval-end for
+  // the same case (enforced inside runEval).
+  const tasks: Task[] = [];
+  for (const p of prepared) {
+    if (p.skill.evals.length === 0) {
+      // No evals — finalize immediately so we still emit a benchmark + suite-end.
+      const benchmark = buildBenchmark([]);
+      const benchmarkPath = path.join(p.skillDir, "benchmark.json");
+      writeFileSync(benchmarkPath, `${JSON.stringify(benchmark, null, 2)}\n`, "utf-8");
+      emit?.({ type: "suite-end", skill: p.skill.name, benchmarkPath, benchmark });
+      continue;
+    }
+    for (let index = 0; index < p.skill.evals.length; index++) {
+      tasks.push({ prepared: p, evalCase: p.skill.evals[index], index });
+    }
+  }
+
+  await runPool(tasks, concurrency, async (task) => {
+    const { prepared: p, evalCase, index } = task;
+    args.onLog?.(`skill ${p.skill.name}: eval ${evalCase.name ?? evalCase.id ?? index + 1}`);
+    const result = await runEval({
+      skill: p.skill,
+      eval: evalCase,
+      index,
+      modes,
+      target: args.target,
+      judge: args.judge,
+      workspace: args.workspace,
+      evalRootDir: p.skillDir,
+      iteration: 0,
+      targetParams: args.targetParams,
+      judgeParams: args.judgeParams,
+      onEvent: emit,
+    });
+
+    // JS is single-threaded between awaits; the stat updates below run
+    // atomically relative to other workers, so no explicit lock is needed.
+    for (const mode of modes) {
+      const modeResult = result.modes[mode];
+      if (!modeResult) continue;
+      p.aggregateRuns.push({
+        mode,
+        passRate: modeResult.grading.summary.pass_rate,
+        durationMs: modeResult.timing.duration_ms,
+        tokens: modeResult.timing.total_tokens,
       });
-
-      for (const mode of modes) {
-        const modeResult = result.modes[mode];
-        if (!modeResult) continue;
-        aggregateRuns.push({
-          mode,
-          passRate: modeResult.grading.summary.pass_rate,
-          durationMs: modeResult.timing.duration_ms,
-          tokens: modeResult.timing.total_tokens,
-        });
-      }
-
-      const withSkill = result.modes.with_skill;
-      if (withSkill) {
-        skillPassed += withSkill.grading.summary.passed;
-        skillFailed += withSkill.grading.summary.failed;
-      }
     }
 
-    const benchmark = buildBenchmark(aggregateRuns);
-    const benchmarkPath = path.join(skillDir, "benchmark.json");
-    writeFileSync(benchmarkPath, `${JSON.stringify(benchmark, null, 2)}\n`, "utf-8");
+    const withSkill = result.modes.with_skill;
+    if (withSkill) {
+      p.passed += withSkill.grading.summary.passed;
+      p.failed += withSkill.grading.summary.failed;
+    }
 
-    emit?.({
-      type: "suite-end",
-      skill: skill.name,
-      benchmarkPath,
-      benchmark,
-    });
+    p.completed++;
+    if (p.completed === p.skill.evals.length) {
+      const benchmark = buildBenchmark(p.aggregateRuns);
+      const benchmarkPath = path.join(p.skillDir, "benchmark.json");
+      writeFileSync(benchmarkPath, `${JSON.stringify(benchmark, null, 2)}\n`, "utf-8");
+      emit?.({
+        type: "suite-end",
+        skill: p.skill.name,
+        benchmarkPath,
+        benchmark,
+      });
+    }
+  });
 
-    writtenSkillDirs.push({ slug, dir: skillDir });
-    passed += skillPassed;
-    failed += skillFailed;
-    const total = skillPassed + skillFailed;
+  // ─── Phase 3: aggregate result + history snapshot + HTML report ───────────
+  let totalPassed = 0;
+  let totalFailed = 0;
+  const skills: EvaluateSkillsResult["skills"] = [];
+  const writtenSkillDirs: { slug: string; dir: string }[] = [];
+  for (const p of prepared) {
+    totalPassed += p.passed;
+    totalFailed += p.failed;
+    const total = p.passed + p.failed;
     skills.push({
-      skill: skill.name,
-      slug,
-      relPath: ref.relPath,
-      evals: skill.evals.length,
-      passRate: total === 0 ? 1 : skillPassed / total,
-      benchmarkPath,
+      skill: p.skill.name,
+      slug: p.slug,
+      relPath: p.ref.relPath,
+      evals: p.skill.evals.length,
+      passRate: total === 0 ? 1 : p.passed / total,
+      benchmarkPath: path.join(p.skillDir, "benchmark.json"),
     });
+    writtenSkillDirs.push({ slug: p.slug, dir: p.skillDir });
   }
 
   // Loop mode: snapshot the freshly-written workspace into a history slot so
@@ -209,5 +281,5 @@ export async function evaluateSkills(args: EvaluateSkillsArgs): Promise<Evaluate
     reportPath = result.reportPath;
   }
 
-  return { passed, failed, skills, historyIteration, reportPath };
+  return { passed: totalPassed, failed: totalFailed, skills, historyIteration, reportPath };
 }
