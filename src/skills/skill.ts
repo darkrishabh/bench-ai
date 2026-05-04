@@ -232,6 +232,17 @@ function parseToolAssertions(value: unknown, where: string): ToolAssertion[] | u
   return value.map((entry, index) => parseToolAssertion(entry, `${where}.tool_assertions[${index}]`));
 }
 
+function parseAssertionString(entry: unknown, where: string): string {
+  if (typeof entry === "string") return entry;
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    const r = entry as Record<string, unknown>;
+    if (typeof r.text === "string") return r.text;
+    if (typeof r.value === "string") return r.value;
+    if (typeof r.criterion === "string") return r.criterion;
+  }
+  throw new Error(`${where} must be a string or { text|value|criterion: string }`);
+}
+
 function parseEval(entry: unknown, evalIndex: number): AgentSkillsEval {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     throw new Error("Each Agent Skills eval must be an object");
@@ -249,7 +260,7 @@ function parseEval(entry: unknown, evalIndex: number): AgentSkillsEval {
     expected_output: typeof record.expected_output === "string" ? record.expected_output : undefined,
     files: Array.isArray(record.files) ? record.files.filter((file): file is string => typeof file === "string") : undefined,
     assertions: Array.isArray(record.assertions)
-      ? record.assertions.filter((assertion): assertion is string => typeof assertion === "string")
+      ? record.assertions.map((entry, i) => parseAssertionString(entry, `${where}.assertions[${i}]`))
       : undefined,
     params: parseParams(record.params, where),
     tools: parseTools(record.tools, where),

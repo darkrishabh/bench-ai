@@ -151,3 +151,54 @@ test("evaluateSkills produces spec workspace layout and summary", async () => {
   assert.ok(benchmark.run_summary.without_skill);
   assert.ok(existsSync(path.join(workspace, "csv-analyzer", "eval-top-months", "with_skill", "outputs")));
 });
+
+test("loadSkill normalizes mixed-shape assertions to strings", () => {
+  const root = tempRoot();
+  const name = "mixed-assertions";
+  const dir = path.join(root, name);
+  mkdirSync(path.join(dir, "evals"), { recursive: true });
+  writeFileSync(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: Mixed-shape assertions test.\n---\n\nBody.\n`);
+  writeFileSync(path.join(dir, "evals", "evals.json"), JSON.stringify({
+    skill_name: name,
+    evals: [{
+      id: 1,
+      name: "mixed",
+      prompt: "Do the thing.",
+      assertions: [
+        "plain string assertion",
+        { text: "object form text" },
+        { value: "object form value" },
+        { criterion: "object form criterion" },
+      ],
+    }],
+  }));
+  const skill = loadSkill(dir);
+  assert.equal(skill.evals.length, 1);
+  assert.deepEqual(skill.evals[0].assertions, [
+    "plain string assertion",
+    "object form text",
+    "object form value",
+    "object form criterion",
+  ]);
+});
+
+test("loadSkill throws with path-aware message on malformed assertion entry", () => {
+  const root = tempRoot();
+  const name = "bad-assertions";
+  const dir = path.join(root, name);
+  mkdirSync(path.join(dir, "evals"), { recursive: true });
+  writeFileSync(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: Bad assertion test.\n---\n\nBody.\n`);
+  writeFileSync(path.join(dir, "evals", "evals.json"), JSON.stringify({
+    skill_name: name,
+    evals: [{
+      id: 1,
+      name: "bad",
+      prompt: "Do the thing.",
+      assertions: ["ok", { foo: "bar" }],
+    }],
+  }));
+  assert.throws(
+    () => loadSkill(dir),
+    (err) => /evals\[0\]\.assertions\[1\]/.test(err.message) && /text\|value\|criterion/.test(err.message),
+  );
+});
